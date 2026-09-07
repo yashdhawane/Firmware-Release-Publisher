@@ -2,89 +2,172 @@
 
 ## Design
 
-The publisher implements the complete firmware release workflow described in the task.
+The publisher implements the complete firmware release workflow described by the
+task specification.
 
-1. Loads `fixtures/build_manifest.csv` into a local DuckDB database.
-2. Reconciles the manifest entirely using SQL:
-   - Removes duplicate rows using `SELECT DISTINCT`.
-   - Excludes withdrawn builds by matching `WITHDRAWAL.supersedes_id` with `BUILD.entry_id`.
-   - Computes the publishable bundles, artifact counts, and total artifact sizes.
-3. Retrieves the current signing key metadata from the distribution gateway instead of hardcoding the key identifier.
-4. Creates a canonical JSON descriptor by sorting object keys before serialization.
-5. Signs each descriptor using OpenSSL CMS detached signatures with the current private key.
-6. Publishes the signed descriptor to the gateway over HTTP.
-7. Stores publication receipts, request tokens, and publication status in `releases.duckdb`.
-8. Before publishing, checks the local database for an existing publication and reuses the stored receipt, ensuring idempotent execution.
+The reference implementation is kept outside the `environment/` directory.
+The `environment/` directory represents the clean environment provided to the
+candidate and must not contain the reference publisher implementation.
 
-Deterministic request tokens are generated using:
+The reference implementation is stored under:
 
-```
-token-<bundle_id>
-```
+`reference/release-publisher.mjs`
 
-This guarantees that rerunning the publisher does not create duplicate publications.
+The positive-control script:
+
+`solution/publish.sh`
+
+installs the reference implementation into:
+
+`/app/publisher/release-publisher.mjs`
+
+before running the publisher.
+
+### Publisher workflow
+
+1. Loads `/app/fixtures/build_manifest.csv` into a local DuckDB database.
+
+2. Reconciles the manifest using SQL:
+
+   - Removes exact duplicate rows.
+   - Identifies `WITHDRAWAL` records.
+   - Excludes `BUILD` rows whose `entry_id` is referenced by a withdrawal.
+   - Groups surviving builds by `bundle_id`.
+   - Computes the surviving artifact count and total byte size.
+   - Processes bundles in ascending `bundle_id` order.
+
+3. Retrieves the current signing-key metadata from:
+
+   `GET /v1/signing-key/current`
+
+   The publisher does not hardcode the signing key identifier.
+
+4. Creates a canonical JSON descriptor for each publishable bundle.
+
+   The descriptor contains:
+
+   - `artifact_count`
+   - `bundle_id`
+   - `total_bytes`
+
+   Object keys are serialized in lexicographical order with no insignificant
+   whitespace.
+
+5. Signs the exact descriptor bytes using OpenSSL CMS detached signatures and
+   the current signing key.
+
+6. Sends the signed descriptor to the distribution gateway over HTTP:
+
+   `POST /v1/publications`
+
+7. Uses a deterministic request token:
+
+   `token-<bundle_id>`
+
+8. Stores publication information in `releases.duckdb`, including:
+
+   - `bundle_id`
+   - `request_token`
+   - `publication_id`
+   - `status`
+
+9. Before submitting a publication, the publisher checks the local publication
+   ledger. If the deterministic request token already has a successful
+   publication, the stored receipt is reused instead of submitting a duplicate.
+
+This makes repeated executions idempotent.
 
 ---
 
 ## Design Decisions
 
-- DuckDB is used for all reconciliation logic because the task explicitly requires SQL-based processing.
-- The current signing key is fetched from the gateway instead of hardcoding the key ID.
-- Canonical JSON is generated before signing to ensure the gateway verifies the exact same bytes.
-- Temporary files created for OpenSSL signing are always removed using a `finally` block.
-- Publication receipts are persisted locally so repeated executions remain deterministic.
+### SQL reconciliation
+
+DuckDB is used for reconciliation because SQL-based reconciliation is an
+explicit requirement of the task.
+
+Exact duplicate manifest rows are removed before withdrawal processing.
+
+Withdrawals are matched using:
+
+`WITHDRAWAL.supersedes_id = BUILD.entry_id`
+
+Only surviving `BUILD` records contribute to a publishable bundle.
+
+### Current signing key
+
+The publisher obtains the current signing-key metadata from the gateway rather
+than assuming a particular key identifier.
+
+The current certificate and private key are used for CMS signing. The revoked
+key is never used for publication.
+
+### Canonical descriptors
+
+The descriptor is serialized deterministically before signing.
+
+The exact UTF-8 bytes used for the signature are also sent to the gateway as
+the descriptor. This prevents signature verification failures caused by
+different JSON representations.
+
+### Temporary signing files
+
+OpenSSL CMS signing uses temporary files where required. Temporary files are
+removed after signing, including when an error occurs.
+
+### Idempotency
+
+Request tokens are deterministic:
+
+`token-<bundle_id>`
+
+Successful publication receipts are persisted in DuckDB. A subsequent run
+checks the local publication table before making another publication request.
+
+This prevents duplicate publications and allows repeated runs to produce
+deterministic status output.
 
 ---
 
 ## Difficulty Added
 
-The assessment combines several independent concepts into a single workflow:
+The assessment combines several independent engineering concepts:
 
 - SQL data reconciliation
-- Duplicate record elimination
-- Withdrawal processing
+- Exact duplicate elimination
+- Withdrawal handling
 - Canonical JSON generation
-- OpenSSL CMS signing
+- OpenSSL CMS detached signatures
+- Signing-key rotation
 - HTTP API integration
 - DuckDB persistence
-- Idempotent publishing
+- Idempotent publication
+- Deterministic command-line output
 
-A hardcoded implementation cannot reliably pass because the verifier recomputes the expected publishable bundles directly from the manifest instead of comparing against fixed output.
+The verifier recomputes the expected publishable bundles from the supplied
+manifest. Therefore, the reference implementation must derive its results
+from the input data rather than relying on fixed bundle counts or hardcoded
+golden output.
 
 ---
 
-## Validation
+## Verification Strategy
 
-### Negative Run
+The task uses two separate verification runs.
 
-No publisher implementation was provided.
+### Proof A — Negative Control
 
-Result:
+The environment is built from scratch with:
 
-```
+`/app/publisher/`
+
+empty.
+
+No reference publisher is installed.
+
+The verifier is then executed directly.
+
+Expected result:
+
+```text
 Reward = 0
-```
-
-The publisher produced no valid output and no publications were created.
-
-### Positive Run
-
-Implemented:
-
-- `publisher/release-publisher.mjs`
-- `solution/publish.sh`
-
-Result:
-
-```
-Reward = 1
-```
-
-The publisher successfully:
-
-- reconciled the manifest,
-- signed every publishable bundle,
-- published using the current signing key,
-- persisted publication receipts,
-- reproduced deterministic output,
-- remained idempotent across repeated executions.
